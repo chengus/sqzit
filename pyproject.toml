@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqzit"
+version = "0.1.0"
+description = "A terminal UI for safely compressing images and videos with FFmpeg."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=1.0.0",
+]
+
+[project.scripts]
+sqzit = "sqzit.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqzit"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
