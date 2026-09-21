@@ -29,8 +29,10 @@ Replace mode stores the old file in a sibling `_backup` folder before the new
 file is installed. Copy mode writes `name.compressed.ext` beside the source
 and never overwrites an existing output.
 
-In the TUI, use `A` to select all, `N` for none, `I` to invert, Space to
-toggle the current row, `P` to pause/resume, and `C` to cancel. The profile
-controls can be overridden per run for video codec/CRF, image format/quality,
-and lossless mode. sqzit checks that the selected FFmpeg encoders are
-available before starting a batch.
+The TUI keeps source/profile controls in a stable left panel and candidates in
+the main workspace. Use `?` for the keyboard guide, `/` to filter paths,
+`j`/`k` or arrows to move, `Space` to toggle, `A` to select all, `N` for none,
+`I` to invert, `P` to pause/resume, and `C` to cancel. The profile controls can
+be overridden per run for video codec/CRF, image format/quality, and lossless
+mode. sqzit checks that the selected FFmpeg encoders are available before
+starting a batch.
