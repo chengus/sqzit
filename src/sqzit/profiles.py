@@ -5,9 +5,11 @@ from typing import Iterable
 
 
 VIDEO_CODECS = {
-    "H.264": "libx264",
-    "H.265 / HEVC": "libx265",
-    "AV1": "libsvtav1",
+    "Auto H.264 (hardware when available)": "auto_h264",
+    "Auto HEVC (hardware when available)": "auto_hevc",
+    "H.264 (software)": "libx264",
+    "H.265 / HEVC (software)": "libx265",
+    "AV1 (software)": "libsvtav1",
     "Copy video stream": "copy",
 }
 
@@ -36,7 +38,7 @@ class CompressionProfile:
 PROFILES: dict[str, CompressionProfile] = {
     "balanced": CompressionProfile(
         name="Balanced",
-        video_codec="libx264",
+        video_codec="auto_h264",
         video_crf=23,
         video_preset="medium",
         image_format="preserve",
@@ -44,7 +46,7 @@ PROFILES: dict[str, CompressionProfile] = {
     ),
     "smaller": CompressionProfile(
         name="Smaller files",
-        video_codec="libx265",
+        video_codec="auto_hevc",
         video_crf=28,
         video_preset="medium",
         image_format="webp",
@@ -94,6 +96,10 @@ def estimate_factor(kind: str, profile: CompressionProfile, source_codec: str | 
         return max(0.52, min(0.90, profile.image_quality / 100 + 0.05))
     if profile.video_codec == "copy":
         return 1.0
-    if source_codec == profile.video_codec.removeprefix("lib"):
+    target_codec = {
+        "auto_h264": "h264",
+        "auto_hevc": "hevc",
+    }.get(profile.video_codec, profile.video_codec.removeprefix("lib"))
+    if source_codec == target_codec:
         return 0.82 if profile.video_crf <= 24 else 0.70
     return 0.62 if profile.video_crf <= 24 else 0.48

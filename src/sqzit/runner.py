@@ -18,6 +18,7 @@ class JobUpdate:
     item: MediaItem
     result: CompressionResult | None = None
     progress: float | None = None
+    encoder: str | None = None
 
 
 class CompressionRunner:
@@ -55,8 +56,8 @@ class CompressionRunner:
 
             started = time.monotonic()
 
-            def progress(value: float | None, _filename: str) -> None:
-                on_update(JobUpdate(index, total, item, progress=value))
+            def progress(value: float | None, _filename: str, encoder: str) -> None:
+                on_update(JobUpdate(index, total, item, progress=value, encoder=encoder))
 
             try:
                 raw = compress_item(item, self.profile, self.mode, self.control, progress)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.events import Resize
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Select, Static, Switch
@@ -46,7 +46,8 @@ class HelpScreen(ModalScreen[None]):
             "NAVIGATION\n"
             "  ↑/↓ or j/k   move through candidates\n"
             "  Tab / Shift+Tab   move between panels\n"
-            "  Enter / Space   toggle the highlighted file\n"
+            "  Click / Enter / Space   toggle the highlighted file\n"
+            "  Compress N   start compression for selected files\n"
             "  /              filter paths\n"
             "\n"
             "SELECTION\n"
@@ -84,6 +85,23 @@ def _human_size(value: int | None) -> str:
     return f"{value} B"
 
 
+def _human_media_size(value: int) -> str:
+    """Format final before/after sizes in decimal MB or GB."""
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f} GB"
+    return f"{value / 1_000_000:.1f} MB"
+
+
+def _format_size_change(original_bytes: int, new_bytes: int) -> str:
+    if original_bytes <= 0:
+        return f"{_human_media_size(original_bytes)} > {_human_media_size(new_bytes)}"
+    change_percent = (new_bytes - original_bytes) / original_bytes * 100
+    return (
+        f"{_human_media_size(original_bytes)} > {_human_media_size(new_bytes)} "
+        f"({change_percent:.1f}%)"
+    )
+
+
 def _format_savings(item: MediaItem) -> str:
     ratio = item.estimated_savings_ratio
     return f"{ratio:.0%}" if ratio is not None else "-"
@@ -100,19 +118,36 @@ def _format_duration(value: float | None) -> str:
 
 def _status_label(status: str) -> str:
     return {
-        "ready": "[ready]",
-        "compressed": "[ok]",
-        "skipped": "[skip]",
-        "failed": "[ERR]",
-        "cancelled": "[STOP]",
-    }.get(status, f"[{status}]")
+        "ready": "READY",
+        "compressed": "DONE",
+        "skipped": "SKIP",
+        "failed": "FAIL",
+        "cancelled": "STOP",
+    }.get(status, status.upper())
 
 
 def _progress_bar(value: float | None, width: int = 24) -> str:
     if value is None:
-        return "[working]"
+        return "working"
     completed = max(0, min(width, round(value * width)))
-    return f"[{('█' * completed) + ('░' * (width - completed))}] {value:.0%}"
+    return f"{('█' * completed) + ('░' * (width - completed))} {value:.0%}"
+
+
+def _activity_encoder_label(encoder: str | None, compact: bool = False) -> str:
+    labels = {
+        "h264_videotoolbox": ("VideoToolbox H.264", "VideoToolbox"),
+        "hevc_videotoolbox": ("VideoToolbox HEVC", "VideoToolbox"),
+        "libx264": ("Software H.264", "CPU H.264"),
+        "libx265": ("Software HEVC", "CPU HEVC"),
+        "libsvtav1": ("Software AV1", "CPU AV1"),
+        "copy": ("Stream copy", "Copy"),
+        "libwebp": ("WebP encoder", "WebP"),
+        "libaom-av1": ("AV1 encoder", "AV1"),
+        "png": ("PNG encoder", "PNG"),
+        "mjpeg": ("JPEG encoder", "JPEG"),
+    }
+    full, short = labels.get(encoder or "", (encoder or "starting", encoder or "starting"))
+    return short if compact else full
 
 
 class SqzitApp(App):
@@ -150,8 +185,8 @@ class SqzitApp(App):
         padding: 1;
     }
     #sidebar {
-        width: 36;
-        min-width: 30;
+        width: 34;
+        min-width: 25;
         height: 1fr;
         padding: 1 2;
         background: $bg-surface;
@@ -192,12 +227,29 @@ class SqzitApp(App):
     }
     #sidebar Input, #sidebar Select { width: 1fr; }
     #sidebar .short-field { width: 12; }
-    #sidebar Button { width: 1fr; margin-top: 1; }
-    #scan { color: $fg-emphasis; background: $accent-primary; }
-    #start { color: $bg-base; background: $status-success; }
-    #pause, #cancel { width: 1fr; }
-    #action-row { height: 3; }
-    #action-row Button { margin-right: 1; }
+    #selection-toolbar {
+        height: 4;
+        align: left middle;
+        padding: 0 1;
+        background: $bg-surface;
+    }
+    #selection-toolbar Button {
+        margin-right: 1;
+        min-width: 7;
+        color: $fg-emphasis !important;
+        text-opacity: 1;
+        text-style: bold;
+    }
+    #selection-toolbar Button:disabled { color: $fg-muted !important; text-opacity: 1; }
+    #compress-selected {
+        min-width: 17;
+        color: $bg-base !important;
+        background: $status-success;
+        text-opacity: 1;
+        text-style: bold;
+    }
+    #scan { min-width: 7; color: $fg-emphasis !important; background: $accent-primary; }
+    #pause, #cancel { display: none; }
     #session-summary {
         height: auto;
         min-height: 5;
@@ -207,11 +259,12 @@ class SqzitApp(App):
         border: round $border;
     }
     #workspace-header {
-        height: 5;
+        height: auto;
         padding: 0 1;
         background: $bg-surface;
         border: round $border;
     }
+    #workspace-topline { height: 3; }
     #workspace-title { color: $fg-emphasis; text-style: bold; }
     #selection-count { color: $fg-muted; }
     #scan-state { width: 1fr; text-align: right; color: $status-info; }
@@ -237,7 +290,7 @@ class SqzitApp(App):
     }
     .detail-card {
         width: 1fr;
-        padding: 1 2;
+        padding: 0 1;
         background: $bg-surface;
         border: round $border;
     }
@@ -291,6 +344,7 @@ class SqzitApp(App):
         self.running = False
         self.table_row_keys: list[str] = []
         self.setting_profile_controls = False
+        self.job_states: dict[Path, tuple[MediaItem, str, float | None, str | None]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -299,7 +353,7 @@ class SqzitApp(App):
             id="too-small",
         )
         with Horizontal(id="main-layout"):
-            with Vertical(id="sidebar"):
+            with VerticalScroll(id="sidebar"):
                 yield Static("SQZIT  /  MEDIA COMPRESSION", id="brand")
                 yield Static("SOURCE", classes="section-title")
                 yield Label("Folder", classes="field-label")
@@ -355,20 +409,23 @@ class SqzitApp(App):
                     yield Label("Parallel jobs")
                     yield Input(value=str(self.initial_jobs), id="jobs", classes="short-field", type="integer")
 
-                yield Button("Scan folder", id="scan", variant="primary")
-                with Horizontal(id="action-row"):
-                    yield Button("Start", id="start", variant="success", disabled=True)
-                    yield Button("Pause", id="pause", disabled=True)
-                    yield Button("Cancel", id="cancel", disabled=True)
                 yield Static("Scan a folder to begin.", id="session-summary")
 
             with Vertical(id="workspace"):
-                with Horizontal(id="workspace-header"):
-                    with Vertical():
-                        yield Static("MEDIA CANDIDATES", id="workspace-title")
-                        yield Static("Select files before starting a job", id="selection-count")
-                    yield Input(placeholder="Filter paths…", id="search")
-                    yield Static("idle", id="scan-state")
+                with Vertical(id="workspace-header"):
+                    with Horizontal(id="workspace-topline"):
+                        with Vertical():
+                            yield Static("MEDIA CANDIDATES", id="workspace-title")
+                            yield Static("Space or Enter toggles the focused row", id="selection-count")
+                        yield Input(placeholder="Filter paths…", id="search")
+                        yield Static("idle", id="scan-state")
+                    with Horizontal(id="selection-toolbar"):
+                        yield Button("Select all", id="select-all")
+                        yield Button("Clear", id="select-none")
+                        yield Button("Scan", id="scan", variant="primary")
+                        yield Button("Compress 0", id="compress-selected", variant="success", disabled=True)
+                        yield Button("Pause", id="pause", disabled=True)
+                        yield Button("Cancel", id="cancel", disabled=True)
                 table = DataTable(id="table", cursor_type="row", zebra_stripes=True)
                 table.add_columns("Sel", "Path", "Kind", "Size", "Codec", "Save", "Status")
                 yield table
@@ -396,10 +453,14 @@ class SqzitApp(App):
         else:
             self.remove_class("too-small")
         if self.is_mounted:
-            sidebar = self.query_one("#sidebar", Vertical)
+            sidebar = self.query_one("#sidebar", VerticalScroll)
             detail_row = self.query_one("#detail-row", Horizontal)
-            sidebar.styles.width = 32 if self.size.width < 105 else 36
-            detail_row.styles.height = 7 if self.size.width < 105 else 8
+            sidebar.styles.width = 28 if self.size.width < 105 else 34
+            detail_row.styles.height = 8
+            self.query_one("#select-all", Button).label = "All" if self.size.width < 105 else "Select all"
+            self.query_one("#compress-selected", Button).styles.min_width = (
+                14 if self.size.width < 105 else 17
+            )
 
     def _profile(self) -> CompressionProfile:
         key = str(self.query_one("#profile", Select).value)
@@ -440,8 +501,11 @@ class SqzitApp(App):
     def _update_selection_count(self) -> None:
         selected = sum(item.selected for item in self.items)
         self.query_one("#selection-count", Static).update(
-            f"{selected} selected  ·  {len(self.items)} candidates"
+            f"{selected} of {len(self.items)} selected  ·  Space/Enter toggles row"
         )
+        compress_button = self.query_one("#compress-selected", Button)
+        compress_button.label = f"Compress {selected}"
+        compress_button.disabled = selected == 0 or self.running
 
     def start_scan(self) -> None:
         if self.scanning or self.running or self.has_class("too-small"):
@@ -449,9 +513,11 @@ class SqzitApp(App):
         directory = self.query_one("#directory", Input).value.strip() or "."
         self.scanning = True
         self.query_one("#scan", Button).disabled = True
-        self.query_one("#start", Button).disabled = True
+        self.query_one("#select-all", Button).disabled = True
+        self.query_one("#select-none", Button).disabled = True
+        self.query_one("#compress-selected", Button).disabled = True
         self.query_one("#scan-state", Static).update("scanning…")
-        self.query_one("#progress", Static).update("[working] probing media")
+        self.query_one("#progress", Static).update("Working · probing media")
         self._set_summary("Scanning with ffprobe…")
         self.run_worker(
             lambda: scan_directory(
@@ -470,13 +536,15 @@ class SqzitApp(App):
         if event.worker.name == "scan":
             self.scanning = False
             self.query_one("#scan", Button).disabled = False
+            self.query_one("#select-all", Button).disabled = False
+            self.query_one("#select-none", Button).disabled = False
             if event.worker.error:
                 error = event.worker.error
                 message = str(error)
                 if isinstance(error, ToolUnavailable):
                     message = f"FFmpeg unavailable: {error}"
                 self.query_one("#scan-state", Static).update("error")
-                self.query_one("#progress", Static).update("[ERR] scan failed")
+                self.query_one("#progress", Static).update("FAIL · scan failed")
                 self._set_summary(message)
                 return
             result = event.worker.result
@@ -485,16 +553,25 @@ class SqzitApp(App):
             eligible = sum(item.selected for item in self.items)
             self.query_one("#scan-state", Static).update("ready")
             self.query_one("#progress", Static).update("Scan complete")
+            self.query_one("#table", DataTable).focus()
             self._set_summary(
                 f"{len(self.items)} media found · {eligible} preselected · {result.skipped} skipped"
             )
-            self.query_one("#start", Button).disabled = not bool(self.items)
+            self._update_selection_count()
         elif event.worker.name == "compression":
             self.running = False
+            self.job_states.clear()
+            self.query_one("#progress", Static).update("Compression finished")
+            self.query_one("#activity-message", Static).display = True
             self.query_one("#pause", Button).disabled = True
             self.query_one("#cancel", Button).disabled = True
+            self.query_one("#pause", Button).display = False
+            self.query_one("#cancel", Button).display = False
             self.query_one("#scan", Button).disabled = False
+            self.query_one("#select-all", Button).disabled = False
+            self.query_one("#select-none", Button).disabled = False
             self.query_one("#scan-state", Static).update("complete")
+            self._update_selection_count()
             if event.worker.error:
                 self._set_summary(f"Compression worker failed: {event.worker.error}")
                 return
@@ -504,9 +581,18 @@ class SqzitApp(App):
                 for status in ("compressed", "skipped", "failed", "cancelled")
             }
             self._set_summary(
-                f"[ok] {counts['compressed']} compressed · [skip] {counts['skipped']} skipped · "
-                f"[ERR] {counts['failed']} failed · [STOP] {counts['cancelled']} cancelled"
+                f"DONE {counts['compressed']} compressed · SKIP {counts['skipped']} skipped · "
+                f"FAIL {counts['failed']} failed · STOP {counts['cancelled']} cancelled"
             )
+            compressed = [result for result in results if result.status == "compressed" and result.output_size]
+            if compressed:
+                original_total = sum(result.source_size for result in compressed)
+                output_total = sum(result.output_size or 0 for result in compressed)
+                self.query_one("#activity-message", Static).update(
+                    "Batch total\n" + _format_size_change(original_total, output_total)
+                )
+            else:
+                self.query_one("#activity-message", Static).update("No files were reduced.")
 
     def _filtered_items(self) -> list[MediaItem]:
         query = self.query_one("#search", Input).value.strip().lower()
@@ -516,13 +602,14 @@ class SqzitApp(App):
 
     def _refresh_table(self) -> None:
         table = self.query_one("#table", DataTable)
+        cursor_row = max(table.cursor_row, 0)
         table.clear(columns=False)
         self.table_row_keys.clear()
         for item in self._filtered_items():
             key = str(item.path)
             self.table_row_keys.append(key)
             table.add_row(
-                "[x]" if item.selected else "[ ]",
+                "✓" if item.selected else "○",
                 str(item.path),
                 item.kind,
                 _human_size(item.size_bytes),
@@ -531,6 +618,8 @@ class SqzitApp(App):
                 _status_label(item.status),
                 key=key,
             )
+        if table.row_count:
+            table.move_cursor(row=min(cursor_row, table.row_count - 1), animate=False)
         self._update_selection_count()
         self._update_detail()
 
@@ -573,18 +662,19 @@ class SqzitApp(App):
     def action_cursor_down(self) -> None:
         table = self.query_one("#table", DataTable)
         if table.row_count:
-            table.cursor_row = min(table.row_count - 1, table.cursor_row + 1)
+            table.move_cursor(row=min(table.row_count - 1, table.cursor_row + 1), animate=False)
             self._update_detail()
 
     def action_cursor_up(self) -> None:
         table = self.query_one("#table", DataTable)
         if table.row_count:
-            table.cursor_row = max(0, table.cursor_row - 1)
+            table.move_cursor(row=max(0, table.cursor_row - 1), animate=False)
             self._update_detail()
 
     def action_search(self) -> None:
         search = self.query_one("#search", Input)
         search.display = True
+        search.styles.width = min(34, max(18, self.size.width - 56))
         search.focus()
         self.add_class("search-open")
 
@@ -599,8 +689,6 @@ class SqzitApp(App):
                 search.display = False
                 self.remove_class("search-open")
                 self.query_one("#table", DataTable).focus()
-        elif event.key == "enter" and self.focused is self.query_one("#table", DataTable):
-            self.action_toggle_current()
 
     def on_data_table_row_selected(self, _event: DataTable.RowSelected) -> None:
         if not self.running:
@@ -617,8 +705,12 @@ class SqzitApp(App):
         button_id = event.button.id
         if button_id == "scan":
             self.start_scan()
-        elif button_id == "start":
+        elif button_id == "compress-selected":
             self.start_compression()
+        elif button_id == "select-all":
+            self.action_select_all()
+        elif button_id == "select-none":
+            self.action_select_none()
         elif button_id == "pause":
             self.action_toggle_pause()
         elif button_id == "cancel":
@@ -655,11 +747,22 @@ class SqzitApp(App):
             return
         self.runner = CompressionRunner(selected, self._profile(), self._mode(), jobs)
         self.running = True
-        self.query_one("#start", Button).disabled = True
+        self.query_one("#activity-message", Static).update("")
+        self.query_one("#activity-message", Static).display = False
+        self.query_one("#compress-selected", Button).disabled = True
         self.query_one("#scan", Button).disabled = True
+        self.query_one("#select-all", Button).disabled = True
+        self.query_one("#select-none", Button).disabled = True
+        self.query_one("#pause", Button).display = True
+        self.query_one("#cancel", Button).display = True
         self.query_one("#pause", Button).disabled = False
         self.query_one("#cancel", Button).disabled = False
         self.query_one("#scan-state", Static).update("running")
+        self.job_states = {
+            item.path: (item, "queued", None, None)
+            for item in selected
+        }
+        self._render_activity()
         self._set_summary(f"Compressing {len(selected)} selected files…")
         self.run_worker(self._run_jobs, name="compression", thread=True, exclusive=True)
 
@@ -669,10 +772,17 @@ class SqzitApp(App):
 
     def _handle_update(self, update: JobUpdate) -> None:
         if update.result is None:
-            self.query_one("#progress", Static).update(
-                f"{update.item.filename}  {_progress_bar(update.progress)}"
+            self.job_states[update.item.path] = (
+                update.item,
+                "working",
+                update.progress,
+                update.encoder,
             )
+            self._render_activity()
             return
+        self.job_states.pop(update.item.path, None)
+        if self.job_states:
+            self._render_activity()
         item = next((candidate for candidate in self.items if candidate.path == update.item.path), None)
         if item is not None:
             item.status = update.result.status
@@ -681,7 +791,53 @@ class SqzitApp(App):
         self.query_one("#progress", Static).update(
             f"{_status_label(update.result.status)} {update.item.filename}"
         )
-        self.query_one("#activity-message", Static).update(update.result.message)
+        if update.result.status == "compressed" and update.result.output_size is not None:
+            self.query_one("#activity-message", Static).display = True
+            encoder_name = update.result.message.split(";", 1)[0]
+            self.query_one("#activity-message", Static).update(
+                f"{update.item.filename} · {encoder_name}\n"
+                f"{_format_size_change(update.result.source_size, update.result.output_size)}"
+            )
+        else:
+            self.query_one("#activity-message", Static).display = True
+            self.query_one("#activity-message", Static).update(
+                f"{_status_label(update.result.status)} · {update.item.filename}\n"
+                f"{update.result.message}"
+            )
+
+    def _render_activity(self) -> None:
+        """Show all active jobs and the next queued files in a stable list."""
+        entries = list(self.job_states.values())
+        active = [entry for entry in entries if entry[1] == "working"]
+        queued = [entry for entry in entries if entry[1] == "queued"]
+        lines = [f"{len(active)} active  ·  {len(queued)} queued"]
+        visible_entries = active + queued
+        card_width = max(20, self.query_one("#activity-card", Vertical).content_size.width)
+        compact = card_width < 34
+        for item, state, progress, encoder in visible_entries[:2]:
+            filename = item.filename
+            if state == "queued":
+                detail = "queued"
+                name_width = max(5, card_width - len(detail) - 2)
+                if len(filename) > name_width:
+                    filename = filename[: max(1, name_width - 1)] + "…"
+                lines.append(f"{filename:<{name_width}} {detail}")
+            else:
+                encoder_label = _activity_encoder_label(encoder, compact=compact)
+                if compact:
+                    progress_label = f"{progress:.0%}" if progress is not None else "0%"
+                    name_width = max(4, card_width - len(progress_label) - len(encoder_label) - 2)
+                    detail = f"{progress_label} {encoder_label}"
+                else:
+                    detail = f"{_progress_bar(progress, width=4)} {encoder_label}"
+                    name_width = max(6, card_width - len(detail) - 2)
+                if len(filename) > name_width:
+                    filename = filename[: max(1, name_width - 1)] + "…"
+                lines.append(f"{filename:<{name_width}} {detail}")
+        remaining = len(visible_entries) - 2
+        if remaining > 0:
+            lines.append(f"… and {remaining} more")
+        self.query_one("#progress", Static).update("\n".join(lines))
 
     def action_toggle_pause(self) -> None:
         if not self.runner:
@@ -698,7 +854,7 @@ class SqzitApp(App):
     def action_cancel(self) -> None:
         if self.runner:
             self.runner.cancel()
-            self.query_one("#progress", Static).update("[STOP] cancelling active jobs safely…")
+            self.query_one("#progress", Static).update("STOP · cancelling active jobs safely…")
 
 
 def run_app(**kwargs: object) -> None:

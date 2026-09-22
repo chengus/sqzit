@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import platform
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -16,13 +18,33 @@ from .output import copy_output_path, install_copy, replace_with_backup, tempora
 from .profiles import CompressionProfile
 
 
-ProgressCallback = Callable[[float | None, str], None]
+ProgressCallback = Callable[[float | None, str, str], None]
 
 
 @dataclass
 class ProcessControl:
     paused: threading.Event
     cancelled: threading.Event
+
+
+@lru_cache(maxsize=1)
+def is_apple_silicon() -> bool:
+    if sys.platform != "darwin":
+        return False
+    if platform.machine().lower() in {"arm64", "aarch64"}:
+        return True
+    # Detect Apple Silicon when Python itself is running under Rosetta.
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.optional.arm64"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=3,
+        )
+        return result.stdout.strip() == "1"
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 @lru_cache(maxsize=1)
@@ -55,12 +77,34 @@ def preserved_image_encoder(item: MediaItem) -> str | None:
     }.get(item.path.suffix.lower())
 
 
+def software_fallback_encoder(profile: CompressionProfile) -> str | None:
+    return {
+        "auto_h264": "libx264",
+        "auto_hevc": "libx265",
+    }.get(profile.video_codec)
+
+
+def resolve_video_encoder(profile: CompressionProfile) -> str:
+    if profile.video_codec not in {"auto_h264", "auto_hevc"}:
+        return profile.video_codec
+    fallback = software_fallback_encoder(profile)
+    if profile.lossless or not is_apple_silicon():
+        return fallback or "libx264"
+    hardware_encoder = {
+        "auto_h264": "h264_videotoolbox",
+        "auto_hevc": "hevc_videotoolbox",
+    }[profile.video_codec]
+    if hardware_encoder in available_encoders():
+        return hardware_encoder
+    return fallback or "libx264"
+
+
 def required_encoder(item: MediaItem, profile: CompressionProfile, mode: str) -> str | None:
     effective_profile = profile
     if mode == "replace" and item.kind == "image" and profile.image_format != "preserve":
         effective_profile = profile.with_overrides(image_format="preserve")
     if item.kind == "video":
-        return None if effective_profile.video_codec == "copy" else effective_profile.video_codec
+        return None if effective_profile.video_codec == "copy" else resolve_video_encoder(effective_profile)
     if effective_profile.image_format == "webp":
         return "libwebp"
     if effective_profile.image_format == "avif":
@@ -92,6 +136,18 @@ def output_suffix(item: MediaItem, profile: CompressionProfile) -> str:
     return "." + profile.image_format
 
 
+def encoder_for_item(item: MediaItem, profile: CompressionProfile) -> str:
+    if item.kind == "video":
+        return profile.video_codec
+    if profile.image_format == "webp" or item.path.suffix.lower() == ".webp":
+        return "libwebp"
+    if profile.image_format == "avif":
+        return "libaom-av1"
+    if profile.image_format == "png":
+        return "png"
+    return preserved_image_encoder(item) or "unknown encoder"
+
+
 def build_ffmpeg_command(
     item: MediaItem,
     profile: CompressionProfile,
@@ -114,6 +170,9 @@ def build_ffmpeg_command(
         command += ["-map", "0:a?", "-c:a", "copy"]
         if profile.video_codec == "copy":
             command += ["-c:v", "copy"]
+        elif profile.video_codec in {"h264_videotoolbox", "hevc_videotoolbox"}:
+            quality = max(1, min(100, round((51 - profile.video_crf) * 100 / 51)))
+            command += ["-c:v", profile.video_codec, "-allow_sw", "0", "-q:v", str(quality)]
         else:
             command += ["-c:v", profile.video_codec]
             if profile.lossless:
@@ -172,6 +231,8 @@ def run_ffmpeg(
     )
     try:
         assert process.stdout is not None
+        if progress:
+            progress(None, item.filename, encoder_for_item(item, profile))
         for line in process.stdout:
             if control.cancelled.is_set():
                 os.killpg(process.pid, signal.SIGCONT)
@@ -190,7 +251,11 @@ def run_ffmpeg(
                 try:
                     seconds = int(line.split("=", 1)[1]) / 1_000_000
                     total = _duration(item)
-                    progress(min(1.0, seconds / total) if total else None, item.filename)
+                    progress(
+                        min(1.0, seconds / total) if total else None,
+                        item.filename,
+                        encoder_for_item(item, profile),
+                    )
                 except (TypeError, ValueError):
                     pass
         return_code = process.wait()
@@ -237,20 +302,43 @@ def compress_item(
     suffix = output_suffix(item, effective_profile)
     destination = copy_output_path(item.path, suffix) if mode == "copy" else item.path
     encoded = temporary_path(item.path.parent, suffix)
+    encode_profile = effective_profile
+    if item.kind == "video" and effective_profile.video_codec != "copy":
+        encode_profile = effective_profile.with_overrides(video_codec=encoder)
     try:
-        run_ffmpeg(item, effective_profile, encoded, control, progress)
+        try:
+            run_ffmpeg(item, encode_profile, encoded, control, progress)
+        except (OSError, RuntimeError):
+            fallback = software_fallback_encoder(effective_profile)
+            if (
+                item.kind != "video"
+                or fallback is None
+                or encoder == fallback
+                or fallback not in available_encoders()
+            ):
+                raise
+            encoded.unlink(missing_ok=True)
+            encoder = fallback
+            encode_profile = effective_profile.with_overrides(video_codec=fallback)
+            if progress:
+                progress(0.0, item.filename, fallback)
+            run_ffmpeg(item, encode_profile, encoded, control, progress)
         validate_output(encoded, item)
         if encoded.stat().st_size >= source_size:
             return {
                 "status": "skipped",
                 "output": None,
-                "message": "encoded file was not smaller",
+                "message": f"{encoder}; encoded file was not smaller",
             }
         if mode == "replace":
             backup = replace_with_backup(item.path, encoded)
-            return {"status": "compressed", "output": item.path, "message": f"backup: {backup}"}
+            return {
+                "status": "compressed",
+                "output": item.path,
+                "message": f"{encoder}; backup: {backup}",
+            }
         output = install_copy(item.path, encoded, destination)
-        return {"status": "compressed", "output": output, "message": str(output)}
+        return {"status": "compressed", "output": output, "message": f"{encoder}; {output}"}
     except InterruptedError:
         return {"status": "cancelled", "output": None, "message": "cancelled"}
     finally:
