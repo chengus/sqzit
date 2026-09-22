@@ -20,6 +20,19 @@ from .profiles import CompressionProfile
 
 ProgressCallback = Callable[[float | None, str, str], None]
 
+SVT_AV1_PRESETS = {
+    "ultrafast": 13,
+    "superfast": 12,
+    "veryfast": 11,
+    "faster": 10,
+    "fast": 9,
+    "medium": 8,
+    "slow": 7,
+    "slower": 6,
+    "veryslow": 5,
+    "placebo": 0,
+}
+
 
 @dataclass
 class ProcessControl:
@@ -178,7 +191,11 @@ def build_ffmpeg_command(
             if profile.lossless:
                 command += ["-qp", "0"]
             else:
-                command += ["-crf", str(profile.video_crf), "-preset", profile.video_preset]
+                command += ["-crf", str(profile.video_crf)]
+            preset = profile.video_preset
+            if profile.video_codec == "libsvtav1":
+                preset = str(SVT_AV1_PRESETS.get(preset, SVT_AV1_PRESETS["medium"]))
+            command += ["-preset", preset]
         if output.suffix.lower() in {".mp4", ".m4v", ".mov"}:
             command += ["-movflags", "+faststart"]
     else:
